@@ -1,120 +1,286 @@
-version: '3.8'
+# Self-hosted n8n: Postgres + external task runners + sandbox service + SearXNG.
+# Everything is configured through .env (see .env.example). Run: docker compose up -d
+#
+# Optional profiles (set COMPOSE_PROFILES in .env):
+#   https  -> Traefik reverse proxy with automatic Let's Encrypt certificates
+#   ngrok  -> ngrok tunnel to a reserved ngrok domain
 
-services:
-  traefik:
-    image: "traefik"
-    restart: always
-    command:
-      - "--api.insecure=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
-      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
-      - "--entrypoints.websecure.address=:443"
-      - "--certificatesresolvers.mytlschallenge.acme.tlschallenge=true"
-      - "--certificatesresolvers.mytlschallenge.acme.email=${SSL_EMAIL}"
-      - "--certificatesresolvers.mytlschallenge.acme.storage=/letsencrypt/acme.json"
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - traefik_data:/letsencrypt
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - n8n-net
-  n8n:
-    build:
-      context: ./n8n-custom
-    restart: always
-    ports:
-      - "127.0.0.1:5678:5678"
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.n8n.rule=Host(`${SUBDOMAIN}.${DOMAIN_NAME}`)
-      - traefik.http.routers.n8n.tls=true
-      - traefik.http.routers.n8n.entrypoints=web,websecure
-      - traefik.http.routers.n8n.tls.certresolver=mytlschallenge
-      - traefik.http.middlewares.n8n.headers.SSLRedirect=true
-      - traefik.http.middlewares.n8n.headers.STSSeconds=315360000
-      - traefik.http.middlewares.n8n.headers.browserXSSFilter=true
-      - traefik.http.middlewares.n8n.headers.contentTypeNosniff=true
-      - traefik.http.middlewares.n8n.headers.forceSTSHeader=true
-      - traefik.http.middlewares.n8n.headers.SSLHost=${DOMAIN_NAME}
-      - traefik.http.middlewares.n8n.headers.STSIncludeSubdomains=true
-      - traefik.http.middlewares.n8n.headers.STSPreload=true
-      - traefik.http.routers.n8n.middlewares=n8n@docker
-    environment:
-      - N8N_HOST=${SUBDOMAIN}.${DOMAIN_NAME}
-      - N8N_RUNNERS_ENABLED=true
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=https
-      - NODE_ENV=production
-      - WEBHOOK_URL=https://${SUBDOMAIN}.${DOMAIN_NAME}/
-      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_HOST=db
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_DATABASE=${DB_POSTGRES_DB}
-      - DB_POSTGRESDB_USER=${DB_POSTGRES_USER}
-      - DB_POSTGRESDB_PASSWORD=${DB_POSTGRES_PASSWORD}
-      - DB_POSTGRESDB_SCHEMA=public
-      - N8N_BASIC_AUTH_ACTIVE=true
-      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
-      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
-    volumes:
-      - n8n_data:/home/node/.n8n
-      - ./local-files:/files
-    depends_on:
-      - db
-    networks:
-      - n8n-net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5678"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits:
-          memory: 8G
-          cpus: '4.0'
-        reservations:
-          memory: 4G
-          cpus: '2.0'
-
-  db:
-    image: pgvector/pgvector:0.8.0-pg17
-    container_name: postgres-compose-db-1
-    restart: always
-    environment:
-      POSTGRES_USER: ${DB_POSTGRES_USER}
-      POSTGRES_PASSWORD: ${DB_POSTGRES_PASSWORD}
-      POSTGRES_DB: ${DB_POSTGRES_DB}
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    networks:
-      - n8n-net
-
-  ngrok:
-    image: ngrok/ngrok:latest
-    restart: unless-stopped
-    environment:
-      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
-    depends_on:
-      - n8n
-    networks:
-      - n8n-net
-    command: http --domain=${NGROK_DOMAIN} n8n:5678
-
-
-volumes:
-  n8n_data:
-  traefik_data:
-  postgres-data:
+name: ${COMPOSE_PROJECT_NAME:-n8n}
 
 networks:
   n8n-net:
+    name: ${DOCKER_NETWORK_NAME:-n8n-net}
     driver: bridge
+    ipam:
+      config:
+        - subnet: ${DOCKER_NETWORK_SUBNET:-172.28.0.0/16}
+
+# Only internal, throwaway state lives in named volumes. All persistent data is
+# bind-mounted from ${DATA_DIR} (see the services below).
+volumes:
+  sandbox-tls:
+  traefik-certs:
+
+services:
+  # One-shot: create the data folders and give each service's user ownership.
+  init-data:
+    image: ${N8N_IMAGE:-docker.io/n8nio/n8n}:${N8N_VERSION}
+    user: '0:0'
+    entrypoint: ['sh', '-c']
+    command:
+      - >
+        mkdir -p /data/postgres /data/n8n /data/files &&
+        chown -R 999:999 /data/postgres &&
+        chown -R 1000:1000 /data/n8n /data/files &&
+        chmod 700 /data/postgres
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+    restart: 'no'
+    network_mode: none
+
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:18}
+    restart: always
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_NON_ROOT_USER: ${POSTGRES_NON_ROOT_USER}
+      POSTGRES_NON_ROOT_PASSWORD: ${POSTGRES_NON_ROOT_PASSWORD}
+      # postgres:18 moved its default data dir. Pinning it keeps the mount stable.
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - ${DATA_DIR:-./data}/postgres:/var/lib/postgresql/data
+      - ./init-data.sh:/docker-entrypoint-initdb.d/init-data.sh:ro
+    # Not published to the host: only n8n reaches it, over the compose network.
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - n8n-net
+
+  sandbox-certs:
+    image: ghcr.io/n8n-io/n8n-sandbox-service-api:${N8N_SANDBOX_VERSION}
+    user: '0:0'
+    entrypoint: ['sh', '-c']
+    command:
+      - >
+        bootstrap-mtls.sh --out-dir /tls --api-san sandbox-api
+        --control-san-prefix sandbox-runner --world-readable &&
+        chown -R sandbox-api:sandbox-api /tls/api && chmod -R a+rX /tls
+    environment:
+      NUM_RUNNERS: '1'
+    volumes:
+      - sandbox-tls:/tls
+    restart: 'no'
+    networks:
+      - n8n-net
+
+  sandbox-api:
+    image: ghcr.io/n8n-io/n8n-sandbox-service-api:${N8N_SANDBOX_VERSION}
+    restart: always
+    depends_on:
+      sandbox-certs:
+        condition: service_completed_successfully
+    environment:
+      SANDBOX_API_KEYS: ${SANDBOX_API_KEYS}
+      SANDBOX_API_RUNNER_REGISTRATION_TOKEN: ${SANDBOX_API_RUNNER_REGISTRATION_TOKEN}
+      SANDBOX_API_RUNNER_API_KEY: ${SANDBOX_API_RUNNER_API_KEY}
+      SANDBOX_API_GRPC_TLS_CERT_FILE: /tls/api/grpc-server.crt
+      SANDBOX_API_GRPC_TLS_KEY_FILE: /tls/api/grpc-server.key
+      SANDBOX_API_GRPC_TLS_CLIENT_CA_FILE: /tls/api/ca.crt
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CA_FILE: /tls/api/ca.crt
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CERT_FILE: /tls/api/control-grpc-api-client.crt
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_KEY_FILE: /tls/api/control-grpc-api-client.key
+      SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_SERVER_NAME: sandbox-runner-1
+    volumes:
+      - sandbox-tls:/tls:ro
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:8080/healthz']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    # Never publish 8080/9090: n8n reaches this container by service name.
+    networks:
+      - n8n-net
+
+  sandbox-runner-1:
+    image: ghcr.io/n8n-io/n8n-sandbox-service-runner-dind:${N8N_SANDBOX_VERSION}
+    restart: always
+    privileged: true # Docker-in-Docker; never expose this container's ports.
+    depends_on:
+      sandbox-api:
+        condition: service_healthy
+    environment:
+      SANDBOX_RUNNER_REGISTRATION_TOKEN: ${SANDBOX_RUNNER_REGISTRATION_TOKEN}
+      SANDBOX_RUNNER_API_KEYS: ${SANDBOX_RUNNER_API_KEYS}
+      SANDBOX_RUNNER_API_GRPC_ADDR: sandbox-api:9090
+      SANDBOX_RUNNER_HTTP_BASE_URL: https://sandbox-runner-1:8080
+      SANDBOX_RUNNER_CONTROL_GRPC_LISTEN_ADDR: ':9091'
+      SANDBOX_RUNNER_CONTROL_GRPC_ADVERTISE_ADDR: sandbox-runner-1:9091
+      SANDBOX_RUNNER_ID: runner-1
+      SANDBOX_RUNNER_DOCKER_SANDBOX_IMAGE: ghcr.io/n8n-io/n8n-sandbox-service-sandbox:${N8N_SANDBOX_VERSION}
+      SANDBOX_RUNNER_REGISTRATION_GRPC_CA_FILE: /tls/runner/ca.crt
+      SANDBOX_RUNNER_REGISTRATION_GRPC_CERT_FILE: /tls/runner/grpc-client.crt
+      SANDBOX_RUNNER_REGISTRATION_GRPC_KEY_FILE: /tls/runner/grpc-client.key
+      SANDBOX_RUNNER_REGISTRATION_GRPC_SERVER_NAME: sandbox-api
+      SANDBOX_RUNNER_CONTROL_GRPC_TLS_CERT_FILE: /tls/runner/control-grpc-server.crt
+      SANDBOX_RUNNER_CONTROL_GRPC_TLS_KEY_FILE: /tls/runner/control-grpc-server.key
+      SANDBOX_RUNNER_CONTROL_GRPC_TLS_CLIENT_CA_FILE: /tls/runner/ca.crt
+    volumes:
+      - sandbox-tls:/tls:ro
+    networks:
+      - n8n-net
+
+  n8n:
+    image: ${N8N_IMAGE:-docker.io/n8nio/n8n}:${N8N_VERSION}
+    restart: always
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      sandbox-api:
+        condition: service_healthy
+    ports:
+      # Plain HTTP on the host. With the https profile keep this on 127.0.0.1.
+      - '${N8N_BIND_ADDRESS:-127.0.0.1}:${N8N_HOST_PORT:-5678}:5678'
+    environment:
+      # --- Public URL / networking ---
+      N8N_HOST: ${N8N_HOST}
+      N8N_PORT: '5678'
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      N8N_EDITOR_BASE_URL: ${WEBHOOK_URL}
+      N8N_PROXY_HOPS: ${N8N_PROXY_HOPS:-0}
+      N8N_SECURE_COOKIE: ${N8N_SECURE_COOKIE:-false}
+      # --- General ---
+      NODE_ENV: production
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-UTC}
+      TZ: ${GENERIC_TIMEZONE:-UTC}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_LOG_LEVEL: ${N8N_LOG_LEVEL:-info}
+      N8N_PAYLOAD_SIZE_MAX: ${N8N_PAYLOAD_SIZE_MAX:-16}
+      N8N_DEPLOYMENT_ARTIFACT: docker-compose
+      N8N_RESTRICT_FILE_ACCESS_TO: /home/node/.n8n-files
+      EXECUTIONS_DATA_PRUNE: ${EXECUTIONS_DATA_PRUNE:-true}
+      EXECUTIONS_DATA_MAX_AGE: ${EXECUTIONS_DATA_MAX_AGE:-336}
+      # --- Database ---
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: '5432'
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_NON_ROOT_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_NON_ROOT_PASSWORD}
+      DB_POSTGRESDB_SCHEMA: public
+      # --- Task runners (Code node) ---
+      N8N_RUNNERS_MODE: external
+      N8N_RUNNERS_BROKER_LISTEN_ADDRESS: 0.0.0.0
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
+      # --- AI assistant: sandbox service, web search, model key ---
+      N8N_INSTANCE_AI_SANDBOX_ENABLED: 'true'
+      N8N_INSTANCE_AI_SANDBOX_PROVIDER: n8n-sandbox
+      N8N_INSTANCE_AI_SANDBOX_API_URL: http://sandbox-api:8080
+      N8N_SANDBOX_SERVICE_URL: http://sandbox-api:8080
+      N8N_SANDBOX_SERVICE_API_KEY: ${N8N_SANDBOX_SERVICE_API_KEY}
+      N8N_INSTANCE_AI_SEARXNG_URL: http://searxng:8080
+      INSTANCE_AI_BRAVE_SEARCH_API_KEY: ${INSTANCE_AI_BRAVE_SEARCH_API_KEY:-}
+      N8N_INSTANCE_AI_MODEL_API_KEY: ${N8N_INSTANCE_AI_MODEL_API_KEY:-}
+    volumes:
+      - ${DATA_DIR:-./data}/n8n:/home/node/.n8n
+      - ${DATA_DIR:-./data}/files:/home/node/.n8n-files
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:5678/healthz || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    mem_limit: ${N8N_MEM_LIMIT:-4g}
+    cpus: ${N8N_CPU_LIMIT:-2}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.n8n.rule=Host(`${N8N_HOST}`)
+      - traefik.http.routers.n8n.entrypoints=websecure
+      - traefik.http.routers.n8n.tls=true
+      - traefik.http.routers.n8n.tls.certresolver=letsencrypt
+      - traefik.http.routers.n8n.middlewares=n8n-headers
+      - traefik.http.services.n8n.loadbalancer.server.port=5678
+      - traefik.http.middlewares.n8n-headers.headers.STSSeconds=315360000
+      - traefik.http.middlewares.n8n-headers.headers.STSIncludeSubdomains=true
+      - traefik.http.middlewares.n8n-headers.headers.STSPreload=true
+      - traefik.http.middlewares.n8n-headers.headers.forceSTSHeader=true
+      - traefik.http.middlewares.n8n-headers.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.n8n-headers.headers.browserXSSFilter=true
+    networks:
+      - n8n-net
+
+  runners:
+    image: ghcr.io/n8n-io/runners:${N8N_VERSION}
+    restart: always
+    depends_on:
+      n8n:
+        condition: service_healthy
+    environment:
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
+      N8N_RUNNERS_TASK_BROKER_URI: http://n8n:5679
+      # Idle runners exit and are relaunched on demand.
+      N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT: '15'
+    # Runs Code node user code. Never publish this container's ports.
+    networks:
+      - n8n-net
+
+  searxng:
+    image: ghcr.io/searxng/searxng:latest
+    restart: always
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET}
+    volumes:
+      - ./searxng-settings.yml:/etc/searxng/settings.yml:ro
+    # Internal-only: n8n reaches it by service name. Never publish its port.
+    networks:
+      - n8n-net
+
+  # --- Optional: HTTPS via Traefik (COMPOSE_PROFILES=https) ---
+  traefik:
+    profiles: [https]
+    image: traefik:v3.2
+    restart: always
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=${DOCKER_NETWORK_NAME:-n8n-net}
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.email=${SSL_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+    ports:
+      - '${TRAEFIK_HTTP_PORT:-80}:80'
+      - '${TRAEFIK_HTTPS_PORT:-443}:443'
+    volumes:
+      - traefik-certs:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - n8n-net
+
+  # --- Optional: ngrok tunnel (COMPOSE_PROFILES=ngrok) ---
+  ngrok:
+    profiles: [ngrok]
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    command: http --url=${NGROK_DOMAIN:-} n8n:5678
+    depends_on:
+      n8n:
+        condition: service_healthy
+    networks:
+      - n8n-net
