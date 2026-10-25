@@ -61,7 +61,7 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache-new
       - name: Show image name
-        run: echo "Docker Image: ${{ env.DOCKER_IMAGE }}"
+        run: echo 'Docker Image=${{ env.DOCKER_IMAGE }}'
 
       - name: Move new cache into place
         run: |
